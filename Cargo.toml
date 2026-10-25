@@ -1,6 +1,6 @@
 [package]
 name = "Mori"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 authors = ["Cendy"]
 
@@ -13,6 +13,7 @@ rusty_enet = { git = "https://github.com/CLOEI/rusty_enet" }
 tokio = { version = "1.50.0", features = ["full"] }
 ureq = { version = "3.3.0", features = ["cookies", "socks-proxy"] }
 md5 = "0.7"
+sha2 = "0.10"
 regex = "1"
 scraper = "0.26"
 serde = { version = "1", features = ["derive"] }

@@ -78,7 +78,7 @@ function AddBotForm({ onDone }: { onDone: () => void }) {
   const [proxyStr, setProxyStr] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [method, setMethod] = useState<'legacy' | 'ltoken'>('legacy')
+  const [method, setMethod] = useState<'legacy' | 'google' | 'ltoken'>('legacy')
 
   function buildProxy(body: SpawnBotBody | SpawnLtokenBody) {
     if (showProxy && proxyStr) {
@@ -117,9 +117,10 @@ function AddBotForm({ onDone }: { onDone: () => void }) {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-1.5">
-      <Tabs value={method} onValueChange={(v) => setMethod(v as 'legacy' | 'ltoken')}>
+      <Tabs value={method} onValueChange={(v) => setMethod(v as 'legacy' | 'google' | 'ltoken')}>
         <TabsList className="w-full h-7">
           <TabsTrigger value="legacy" className="flex-1 text-[10px]">Legacy</TabsTrigger>
+          <TabsTrigger value="google" className="flex-1 text-[10px]">Google</TabsTrigger>
           <TabsTrigger value="ltoken" className="flex-1 text-[10px]">Ltoken</TabsTrigger>
         </TabsList>
 
@@ -138,6 +139,16 @@ function AddBotForm({ onDone }: { onDone: () => void }) {
             onChange={(e) => setPassword(e.target.value)}
             className="h-7 text-xs"
             required={method === 'legacy'}
+          />
+        </TabsContent>
+
+        <TabsContent value="google" className="mt-1.5">
+          <Input
+            placeholder="token|rid|mac|wk"
+            value={ltokenStr}
+            onChange={(e) => setLtokenStr(e.target.value)}
+            className="h-7 text-xs font-mono"
+            required={method === 'google'}
           />
         </TabsContent>
 

@@ -9,6 +9,7 @@ import { SetupPage } from '@/pages/SetupPage'
 import { LoginPage } from '@/pages/LoginPage'
 import { authStore } from '@/lib/auth'
 import { api } from '@/lib/api'
+import { APP_VERSION } from '@/lib/version'
 
 type Page = 'bots' | 'items' | 'proxy' | 'docs'
 type AuthState = 'loading' | 'setup' | 'login' | 'authenticated'
@@ -65,8 +66,11 @@ export default function App() {
   return (
     <div className="h-full flex flex-col antialiased text-sm">
       <header className="shrink-0 h-10 flex items-center justify-between px-4 bg-card border-b border-border">
-        <span className="font-bold tracking-wide text-foreground text-xs">
+        <span className="font-bold tracking-wide text-foreground text-xs flex items-center gap-2">
           Mori<span className="text-primary">.</span>
+          <span className="rounded border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+            v{APP_VERSION}
+          </span>
         </span>
         <nav className="flex gap-0.5">
           <NavBtn active={page === 'bots'} onClick={() => setPage('bots')} icon={<Bot className="w-3 h-3" />} label="Bots" />

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Lock, ShieldCheck, Eye, EyeOff } from 'lucide-react'
 import { api } from '@/lib/api'
 import { authStore } from '@/lib/auth'
+import { APP_VERSION } from '@/lib/version'
 
 interface Props {
   onDone: () => void
@@ -59,6 +60,7 @@ export function SetupPage({ onDone }: Props) {
         </div>
 
         <h1 className="auth-title">Welcome to Mori</h1>
+        <p className="text-[10px] text-muted-foreground">v{APP_VERSION}</p>
         <p className="auth-subtitle">
           Set up a password to protect your dashboard. You can only do this once.
         </p>

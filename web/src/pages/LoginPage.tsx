@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Lock, LogIn, Eye, EyeOff } from 'lucide-react'
 import { api } from '@/lib/api'
 import { authStore } from '@/lib/auth'
+import { APP_VERSION } from '@/lib/version'
 
 interface Props {
   onDone: () => void
@@ -42,6 +43,7 @@ export function LoginPage({ onDone }: Props) {
 
         <h1 className="auth-title">Mori<span className="text-primary">.</span></h1>
         <p className="auth-subtitle">Enter your password to continue.</p>
+        <p className="text-[10px] text-muted-foreground">v{APP_VERSION}</p>
 
         <form onSubmit={handleSubmit} className="auth-form">
           <div className="auth-field">

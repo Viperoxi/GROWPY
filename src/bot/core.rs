@@ -5,10 +5,10 @@ use crate::bot_state::{
 };
 use crate::constants::{get_fhash, get_game_version, get_protocol};
 use crate::cursor::Cursor;
-use crate::protocol::crypto::{compute_klv, generate_rid, hash_string, random_hex, random_mac};
+use crate::protocol::crypto::{compute_klv_sha, generate_rid, hash_string, random_hex, random_mac};
 use crate::events::{WsEvent, WsInvItem, WsObject, WsTile, WsTx};
 use crate::inventory::Inventory;
-use crate::items::ItemsDat;
+use crate::items::{proton_sdk_hash, ItemsDat};
 use crate::login::check_token;
 use crate::protocol::packet::{self, GamePacketType, GameUpdatePacket, IncomingPacket};
 use crate::player::{LocalPlayer, Player, parse_pipe_map};
@@ -20,7 +20,7 @@ use rusty_enet as enet;
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use super::auth::fetch_credentials;
 use super::shared::{BotEventRaw, Socks5Config, TemporaryData};
@@ -227,6 +227,92 @@ fn sorted_blacklist_vec(set: &HashSet<u16>) -> Vec<u16> {
     v
 }
 
+fn pipe_fields(fields: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (key, value) in fields {
+        out.push_str(key);
+        out.push('|');
+        out.push_str(value);
+        out.push('\n');
+    }
+    out
+}
+
+/// `fz` is the official exe size; `zf` is its proton hash. Measured fallback
+/// when Growtopia.exe is not on this machine.
+fn exe_fingerprint() -> (u64, i32) {
+    static FP: OnceLock<(u64, i32)> = OnceLock::new();
+    *FP.get_or_init(|| {
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return (23_883_768, 0);
+        };
+        let path = std::path::PathBuf::from(local)
+            .join("Growtopia")
+            .join("Growtopia.exe");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return (23_883_768, 0);
+        };
+        (bytes.len() as u64, proton_sdk_hash(&bytes))
+    })
+}
+
+fn checktoken_client_data(
+    tank_name: &str,
+    rid: &str,
+    mac: &str,
+    wk: &str,
+    hash: i32,
+    hash2: i32,
+    meta: &str,
+) -> String {
+    let (fz, zf) = exe_fingerprint();
+    let game_ver = get_game_version();
+    let protocol = get_protocol().to_string();
+    let klv = compute_klv_sha(&game_ver, &protocol, rid);
+    let fhash = get_fhash().to_string();
+    let hash = hash.to_string();
+    let hash2 = hash2.to_string();
+    let fz = fz.to_string();
+    let zf = zf.to_string();
+    pipe_fields(&[
+        ("tankIDName", tank_name),
+        ("tankIDPass", ""),
+        ("requestedName", ""),
+        ("f", "1"),
+        ("protocol", protocol.as_str()),
+        ("game_version", game_ver.as_str()),
+        ("fz", fz.as_str()),
+        ("cbits", "0"),
+        ("hash2", hash2.as_str()),
+        ("vid", ""),
+        ("aid", ""),
+        ("gid", ""),
+        ("meta", meta),
+        ("rid", rid),
+        ("platformID", "0,1,1"),
+        ("deviceVersion", "0"),
+        ("country", "es"),
+        ("hash", hash.as_str()),
+        ("mac", mac),
+        ("user", "0"),
+        ("wk", wk),
+        ("fhash", fhash.as_str()),
+        ("GDPR", "1"),
+        ("player_age", "25"),
+        ("assign_button_inverted", "0"),
+        ("aat", "2"),
+        ("category", "_7"),
+        ("totalPlaytime", "0"),
+        ("klv", klv.as_str()),
+        ("lmode", "0"),
+        ("reconnect", "1"),
+        ("FCMToken", ""),
+        ("zf", zf.as_str()),
+        ("rcdl", ""),
+        ("adc", "1"),
+    ])
+}
+
 impl Bot {
     pub fn new(
         username: &str,
@@ -260,8 +346,8 @@ impl Bot {
         let creds = fetch_credentials(username, password, proxy.as_ref(), &mut log_fn);
 
         let mac = random_mac();
-        let hash = hash_string(&format!("{}RT", mac));
-        let hash2 = hash_string(&format!("{}RT", random_hex(16)));
+        let hash = proton_sdk_hash(mac.as_bytes());
+        let hash2 = proton_sdk_hash(format!("{mac}RT").as_bytes());
         let wk = random_hex(32);
         let rid = generate_rid();
 
@@ -363,8 +449,8 @@ impl Bot {
         let (ltoken, rid, mac, wk) = Self::parse_ltoken_string(ltoken_str)
             .expect("[Bot] Invalid ltoken string — expected token|rid|mac|wk");
 
-        let hash = hash_string(&format!("{}RT", mac));
-        let hash2 = hash_string(&format!("{}RT", random_hex(16)));
+        let hash = proton_sdk_hash(mac.as_bytes());
+        let hash2 = proton_sdk_hash(format!("{mac}RT").as_bytes());
 
         let proxy_url = proxy.as_ref().map(|p| p.to_url());
         let proxy_url_ref = proxy_url.as_deref();
@@ -410,16 +496,14 @@ impl Bot {
             }
         };
 
-        let game_ver = get_game_version();
-        let protocol = get_protocol();
-        let fhash = get_fhash();
-        let klv = compute_klv(&game_ver, &protocol.to_string(), &rid, hash);
-        let login_data = format!(
-            "tankIDName|\ntankIDPass|\nrequestedName|\nf|1\nprotocol|{protocol}\n\
-game_version|{game_ver}\nfz|22243512\ncbits|1024\nplayer_age|20\nGDPR|2\nFCMToken|\n\
-category|_-5100\ntotalPlaytime|0\nklv|{klv}\nhash2|{hash2}\nmeta|{}\nfhash|{fhash}\n\
-rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}\nwk|{wk}\nzf|31631978\nlmode|1\n",
-            server_data.meta,
+        let login_data = checktoken_client_data(
+            "",
+            &rid,
+            &mac,
+            &wk,
+            hash,
+            hash2,
+            &server_data.meta,
         );
 
         let ltoken = match check_token(&ltoken, &login_data, proxy_url_ref) {
@@ -588,65 +672,75 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
     }
 
     fn build_login_packet(&self) -> String {
+        // Official client after SERVER_HELLO: four fields. The long dump
+        // goes to the gameserver on OnSendToServer.
         format!(
-            "protocol|{}\nltoken|{}\nplatformID|2\n", get_protocol(),
+            "protocol|{}\nltoken|{}\nplatformID|0,1,1\nadc|1\n",
+            get_protocol(),
             self.ltoken
         )
     }
 
     fn build_redirect_packet(&self, r: &RedirectData) -> String {
+        let (fz, zf) = exe_fingerprint();
         let game_ver = get_game_version();
-        let klv = compute_klv(&game_ver, &get_protocol().to_string(), &self.rid, self.hash);
-        let mut data = String::new();
-        data.push_str(&format!("tankIDName|{}\n", r.tank_id_name));
-        data.push_str("tankIDPass|\n");
-        data.push_str("requestedName|\n");
-        data.push_str("f|1\n");
-        data.push_str("protocol|211\n");
-        data.push_str(&format!("game_version|{}\n", game_ver));
-        data.push_str("fz|47142936\n");
-        data.push_str("cbits|1536\n");
-        data.push_str("player_age|18\n");
-        data.push_str("GDPR|1\n");
-        data.push_str("FCMToken|\n");
-        data.push_str("category|_-5100\n");
-        data.push_str("totalPlaytime|0\n");
-        data.push_str(&format!("klv|{klv}\n"));
-        data.push_str(&format!("hash2|{}\n", self.hash2));
-        data.push_str(&format!("meta|{}\n", self.meta));
-        data.push_str(&format!("fhash|{}\n", get_fhash()));
-        data.push_str(&format!("rid|{}\n", self.rid));
-        data.push_str("platformID|0,1,1\n");
-        data.push_str("deviceVersion|0\n");
-        data.push_str("country|ma\n");
-        data.push_str(&format!("hash|{}\n", self.hash));
-        data.push_str(&format!("mac|{}\n", self.mac));
-        data.push_str(&format!("wk|{}\n", self.wk));
-        data.push_str("zf|-821693372\n");
-        data.push_str(&format!("lmode|{}\n", r.lmode));
-        data.push_str(&format!("user|{}\n", r.user));
-        data.push_str(&format!("token|{}\n", r.token));
-        data.push_str(&format!("UUIDToken|{}\n", r.uuid));
+        let protocol = get_protocol().to_string();
+        let klv = compute_klv_sha(&game_ver, &protocol, &self.rid);
+        let fhash = get_fhash().to_string();
+        let hash = self.hash.to_string();
+        let hash2 = self.hash2.to_string();
+        let fz = fz.to_string();
+        let zf = zf.to_string();
+        let mut fields = vec![
+            ("tankIDName", r.tank_id_name.as_str()),
+            ("tankIDPass", ""),
+            ("requestedName", ""),
+            ("f", "1"),
+            ("protocol", protocol.as_str()),
+            ("game_version", game_ver.as_str()),
+            ("fz", fz.as_str()),
+            ("cbits", "0"),
+            ("player_age", "25"),
+            ("GDPR", "1"),
+            ("FCMToken", ""),
+            ("category", "_7"),
+            ("totalPlaytime", "0"),
+            ("klv", klv.as_str()),
+            ("hash2", hash2.as_str()),
+            ("meta", self.meta.as_str()),
+            ("fhash", fhash.as_str()),
+            ("rid", self.rid.as_str()),
+            ("platformID", "0,1,1"),
+            ("deviceVersion", "0"),
+            ("country", "es"),
+            ("hash", hash.as_str()),
+            ("mac", self.mac.as_str()),
+            ("wk", self.wk.as_str()),
+            ("zf", zf.as_str()),
+            ("lmode", r.lmode.as_str()),
+            ("reconnect", "1"),
+            ("user", r.user.as_str()),
+            ("token", r.token.as_str()),
+            ("UUIDToken", r.uuid.as_str()),
+        ];
         if !r.door_id.is_empty() {
-            data.push_str(&format!("doorID|{}\n", r.door_id));
+            fields.push(("doorID", r.door_id.as_str()));
         }
-        data.push_str("aat|2\n");
-        data
+        fields.push(("aat", "2"));
+        pipe_fields(&fields)
     }
 
-    /// Builds the `clientData` string sent to the check-token endpoint.
-    /// Uses the bot's stable per-session values (rid, mac, wk, hash, hash2).
+    /// `clientData` for checktoken. Same device fields as the gameserver dump,
+    /// without the session token.
     fn build_login_data(&self) -> String {
-        let game_ver = get_game_version();
-        let protocol = get_protocol();
-        let fhash = get_fhash();
-        let klv = compute_klv(&game_ver, &protocol.to_string(), &self.rid, self.hash);
-        format!(
-            "tankIDName|\ntankIDPass|\nrequestedName|\nf|1\nprotocol|{protocol}\n\
-game_version|{game_ver}\nfz|22243512\ncbits|1024\nplayer_age|20\nGDPR|2\nFCMToken|\n\
-category|_-5100\ntotalPlaytime|0\nklv|{klv}\nhash2|{}\nmeta|{}\nfhash|{fhash}\n\
-rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nzf|31631978\nlmode|1\n",
-            self.hash2, self.meta, self.rid, self.hash, self.mac, self.wk,
+        checktoken_client_data(
+            &self.username,
+            &self.rid,
+            &self.mac,
+            &self.wk,
+            self.hash,
+            self.hash2,
+            &self.meta,
         )
     }
 

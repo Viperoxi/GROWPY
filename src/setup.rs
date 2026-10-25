@@ -18,6 +18,21 @@ fn default_protocol() -> u32 {
     DEFAULT_PROTOCOL
 }
 
+fn version_parts(v: &str) -> Vec<u32> {
+    v.split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+fn newest_version<'a>(versions: &[&'a str]) -> &'a str {
+    versions
+        .iter()
+        .copied()
+        .max_by(|a, b| version_parts(a).cmp(&version_parts(b)))
+        .unwrap_or(DEFAULT_GAME_VER)
+}
+
 fn default_fhash() -> i32 {
     DEFAULT_FHASH
 }
@@ -189,19 +204,24 @@ pub fn init() {
     current_config.fhash = DEFAULT_FHASH;
     let agent = create_agent();
 
-    // 1. Check latest game version
+    // 1. Check latest game version. The archive lags the live server:
+    // a login on 5.59 was rejected with "The V5.61 update is now available".
     match fetch_latest_game_version(&agent) {
         Ok(v) => {
             println!("[Setup] Latest Growtopia version: {}", v);
-            current_config.game_version = v;
+            let chosen = newest_version(&[&v, DEFAULT_GAME_VER, current_config.game_version.as_str()]).to_string();
+            current_config.game_version = chosen;
         }
         Err(e) => {
+            let chosen = newest_version(&[DEFAULT_GAME_VER, current_config.game_version.as_str()]).to_string();
+            current_config.game_version = chosen;
             eprintln!(
                 "[Setup] Warning: Failed to fetch latest game version: {e}. Using: {}",
                 current_config.game_version
             );
         }
     }
+    println!("[Setup] Using game version: {}", current_config.game_version);
 
     // 2. Check latest items.dat archive
     match fetch_latest_items_meta(&agent) {
@@ -301,6 +321,12 @@ mod tests {
         assert_eq!(cache_dir(), PathBuf::from(".cache"));
         assert_eq!(items_dat_path(), PathBuf::from(".cache/items.dat"));
         assert_eq!(config_path(), PathBuf::from(".cache/config.json"));
+    }
+
+    #[test]
+    fn test_newest_version_prefers_live_client() {
+        assert_eq!(newest_version(&["5.59", "5.61", "5.59"]), "5.61");
+        assert_eq!(newest_version(&["5.62", "5.61"]), "5.62");
     }
 
     #[test]
