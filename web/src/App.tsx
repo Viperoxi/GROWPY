@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react'
-import { Bot, Package, BookOpen, ShieldCheck, LogOut } from 'lucide-react'
+import { Bot, Package, BookOpen, ShieldCheck, LogOut, Settings2, Library } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { BotsPage } from '@/pages/BotsPage'
 import { ItemsPage } from '@/pages/ItemsPage'
 import { DocsPage } from '@/pages/DocsPage'
+import { OptionsPage } from '@/pages/OptionsPage'
+import { ScriptsPage } from '@/pages/ScriptsPage'
 import { ProxyPage } from '@/pages/ProxyPage'
 import { SetupPage } from '@/pages/SetupPage'
 import { LoginPage } from '@/pages/LoginPage'
@@ -11,7 +13,7 @@ import { authStore } from '@/lib/auth'
 import { api } from '@/lib/api'
 import { APP_VERSION } from '@/lib/version'
 
-type Page = 'bots' | 'items' | 'proxy' | 'docs'
+type Page = 'bots' | 'items' | 'proxy' | 'docs' | 'options' | 'scripts'
 type AuthState = 'loading' | 'setup' | 'login' | 'authenticated'
 
 export default function App() {
@@ -76,6 +78,8 @@ export default function App() {
           <NavBtn active={page === 'bots'} onClick={() => setPage('bots')} icon={<Bot className="w-3 h-3" />} label="Bots" />
           <NavBtn active={page === 'items'} onClick={() => setPage('items')} icon={<Package className="w-3 h-3" />} label="Items" />
           <NavBtn active={page === 'proxy'} onClick={() => setPage('proxy')} icon={<ShieldCheck className="w-3 h-3" />} label="Proxy" />
+          <NavBtn active={page === 'options'} onClick={() => setPage('options')} icon={<Settings2 className="w-3 h-3" />} label="Options" />
+          <NavBtn active={page === 'scripts'} onClick={() => setPage('scripts')} icon={<Library className="w-3 h-3" />} label="Scripts" />
           <NavBtn active={page === 'docs'} onClick={() => setPage('docs')} icon={<BookOpen className="w-3 h-3" />} label="Docs" />
           <button
             onClick={handleLogout}
@@ -90,6 +94,8 @@ export default function App() {
         {page === 'bots' && <BotsPage />}
         {page === 'items' && <ItemsPage />}
         {page === 'proxy' && <ProxyPage />}
+        {page === 'options' && <OptionsPage />}
+        {page === 'scripts' && <ScriptsPage />}
         {page === 'docs' && <DocsPage />}
       </div>
     </div>

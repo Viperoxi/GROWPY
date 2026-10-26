@@ -5,12 +5,14 @@ use crate::protocol::variant::{Variant, VariantList};
 use crate::protocol::packet::GameUpdatePacket;
 use crate::player::Player;
 use crate::world::{Tile, World, WorldNpc, WorldObject};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub(super) struct BotProxy {
     pub req_tx: crossbeam_channel::Sender<crate::script_channel::ScriptRequest>,
     pub reply_rx: crossbeam_channel::Receiver<crate::script_channel::ScriptReply>,
     pub state: Arc<RwLock<BotState>>,
+    pub stop_flag: Arc<AtomicBool>,
 }
 
 impl BotProxy {
@@ -18,8 +20,24 @@ impl BotProxy {
         &self,
         req: crate::script_channel::ScriptRequest,
     ) -> crate::script_channel::ScriptReply {
-        self.req_tx.send(req).expect("bot thread gone");
-        self.reply_rx.recv().expect("bot thread gone")
+        if self.stop_flag.load(Ordering::Relaxed) {
+            return crate::script_channel::ScriptReply::Ack;
+        }
+        if self.req_tx.send(req).is_err() {
+            return crate::script_channel::ScriptReply::Ack;
+        }
+        loop {
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return crate::script_channel::ScriptReply::Ack;
+            }
+            match self.reply_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(reply) => return reply,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return crate::script_channel::ScriptReply::Ack;
+                }
+            }
+        }
     }
 }
 

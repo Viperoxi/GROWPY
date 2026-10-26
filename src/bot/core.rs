@@ -420,6 +420,7 @@ impl Bot {
             s.collect_radius_tiles = bot.collect_radius_tiles;
             s.collect_blacklist = sorted_blacklist_vec(&bot.collect_blacklist);
         }
+        bot.apply_global_options(&crate::options::load_options());
         bot.host.connect(creds.addr, 2, 0);
         bot
     }
@@ -584,6 +585,7 @@ impl Bot {
             s.collect_radius_tiles = bot.collect_radius_tiles;
             s.collect_blacklist = sorted_blacklist_vec(&bot.collect_blacklist);
         }
+        bot.apply_global_options(&crate::options::load_options());
         bot.host.connect(addr, 2, 0);
         bot
     }
@@ -661,7 +663,7 @@ impl Bot {
         {
             let mut s = self.state.write().unwrap();
             s.console.push(msg.clone());
-            if s.console.len() > 100 {
+            if s.console.len() > 500 {
                 s.console.remove(0);
             }
         }
@@ -822,6 +824,10 @@ impl Bot {
                 }
             }
             while let Ok(cmd) = self.cmd_rx.try_recv() {
+                if matches!(cmd, BotCommand::StopScript | BotCommand::RunScript { .. }) {
+                    self.pathfind_target = None;
+                    self.pathfind_recalc = false;
+                }
                 self.handle_command(cmd);
             }
             if let Some(id) = self.peer_id {
@@ -847,10 +853,26 @@ impl Bot {
         }
     }
 
-    /// Sleep for `ms` milliseconds while keeping ENet alive.
+    /// Sleep for `ms` milliseconds while keeping ENet alive and still
+    /// accepting panel commands such as Stop / Run.
     pub fn sleep_ms(&mut self, ms: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
         while std::time::Instant::now() < deadline {
+            if self.script_stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut got_cmd = false;
+            while let Ok(cmd) = self.cmd_rx.try_recv() {
+                got_cmd = true;
+                if matches!(cmd, BotCommand::StopScript | BotCommand::RunScript { .. }) {
+                    self.pathfind_target = None;
+                    self.pathfind_recalc = false;
+                }
+                self.handle_command(cmd);
+            }
+            if got_cmd {
+                return;
+            }
             self.service_once();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -2425,6 +2447,10 @@ impl Bot {
         self.pathfind_recalc = false;
 
         while self.pathfind_target.is_some() {
+            if self.script_stop.load(Ordering::Relaxed) {
+                self.pathfind_target = None;
+                return;
+            }
             if self.world.is_none() {
                 self.pathfind_target = None;
                 return;
@@ -2755,6 +2781,8 @@ impl Bot {
                 self.find_path(x, y);
             }
             BotCommand::RunScript { content } => {
+                self.pathfind_target = None;
+                self.pathfind_recalc = false;
                 // Stop any currently running script first.
                 self.script_stop.store(true, Ordering::Relaxed);
                 // Drop old channels so the previous script thread (if any) sees disconnection.
@@ -2763,6 +2791,9 @@ impl Bot {
                 self.event_tx = None;
 
                 self.script_stop.store(false, Ordering::Relaxed);
+                let options = crate::options::load_options();
+                self.apply_global_options(&options);
+                self.log_console("[Lua] starting script".to_string());
 
                 let (req_tx, req_rx) =
                     crossbeam_channel::unbounded::<crate::script_channel::ScriptRequest>();
@@ -2778,15 +2809,24 @@ impl Bot {
                 let state = self.state.clone();
                 let stop_flag = self.script_stop.clone();
                 let username = self.username.clone();
+                let bot_id = self.bot_id;
+                let ws_tx = self.ws_tx.clone();
 
                 std::thread::spawn(move || {
                     crate::lua::run_script_threaded(
                         req_tx, reply_rx, event_rx, items, state, stop_flag, username, content,
+                        bot_id, ws_tx, options,
                     );
                 });
             }
             BotCommand::StopScript => {
+                self.pathfind_target = None;
+                self.pathfind_recalc = false;
                 self.script_stop.store(true, Ordering::Relaxed);
+                self.script_req_rx = None;
+                self.script_reply_tx = None;
+                self.event_tx = None;
+                self.log_console("[Lua] script stopped".to_string());
             }
             BotCommand::Say { text } => {
                 self.say(&text);
@@ -2868,6 +2908,39 @@ impl Bot {
             }
             BotCommand::AcceptAccess => self.accept_access(),
         }
+    }
+
+    fn apply_global_options(&mut self, opts: &crate::options::GlobalOptions) {
+        self.delays.place_ms = opts.place_ms;
+        self.delays.walk_ms = opts.walk_ms;
+        self.auto_collect = opts.auto_collect;
+        self.collect_radius_tiles = opts.collect_range.clamp(1, 5);
+        self.collect_path_check = opts.collect_path_check;
+        self.ignore_gems = opts.ignore_gems;
+        self.ignore_essences = opts.ignore_essences;
+        {
+            let mut s = self.state.write().unwrap();
+            s.delays.place_ms = opts.place_ms;
+            s.delays.walk_ms = opts.walk_ms;
+            s.auto_collect = opts.auto_collect;
+            s.collect_radius_tiles = self.collect_radius_tiles;
+            s.collect_path_check = opts.collect_path_check;
+            s.ignore_gems = opts.ignore_gems;
+            s.ignore_essences = opts.ignore_essences;
+        }
+        self.emit(WsEvent::BotDelays {
+            bot_id: self.bot_id,
+            place_ms: opts.place_ms,
+            walk_ms: opts.walk_ms,
+            twofa_secs: self.delays.twofa_secs,
+            server_overload_secs: self.delays.server_overload_secs,
+            too_many_logins_secs: self.delays.too_many_logins_secs,
+            maintenance_secs: self.delays.maintenance_secs,
+        });
+        self.emit(WsEvent::BotAutoCollect {
+            bot_id: self.bot_id,
+            enabled: opts.auto_collect,
+        });
     }
 
     // ── Lua-callable helpers ────────────────────────────────────────────────────

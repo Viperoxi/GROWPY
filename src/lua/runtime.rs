@@ -493,7 +493,10 @@ impl LuaUserData for BotProxy {
         });
 
         // ── Script control ─────────────────────────────────────────────────────
-        methods.add_method("stopScript", |_, _p, ()| Ok(()));
+        methods.add_method("stopScript", |_, p, ()| {
+            p.stop_flag.store(true, Ordering::Relaxed);
+            Ok(())
+        });
     }
 }
 
@@ -947,8 +950,14 @@ pub fn run_script_threaded(
     stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     username:  String,
     script:    String,
+    bot_id:    u32,
+    ws_tx:     Option<crate::events::WsTx>,
+    options:   crate::options::GlobalOptions,
 ) {
-    run_script_inner(req_tx, reply_rx, event_rx, items, state, stop_flag, username, script);
+    run_script_inner(
+        req_tx, reply_rx, event_rx, items, state, stop_flag, username, script, bot_id, ws_tx,
+        options,
+    );
 }
 
 fn run_script_inner(
@@ -960,7 +969,47 @@ fn run_script_inner(
     stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     username:  String,
     script:    String,
+    bot_id:    u32,
+    ws_tx:     Option<crate::events::WsTx>,
+    options:   crate::options::GlobalOptions,
 ) {
+    let report = |msg: String| {
+        println!("{msg}");
+        {
+            let mut s = state.write().unwrap();
+            s.console.push(msg.clone());
+            if s.console.len() > 500 {
+                s.console.remove(0);
+            }
+        }
+        if let Some(tx) = &ws_tx {
+            let _ = tx.send(crate::events::WsEvent::Console {
+                bot_id,
+                message: msg,
+            });
+        }
+    };
+
+    fn lua_vals_to_string(vals: &mlua::MultiValue) -> String {
+        let parts: Vec<String> = vals
+            .iter()
+            .map(|v| match v {
+                LuaValue::Nil => "nil".into(),
+                LuaValue::Boolean(b) => b.to_string(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => n.to_string(),
+                LuaValue::String(s) => s.to_string_lossy(),
+                LuaValue::Table(_) => "table".into(),
+                LuaValue::Function(_) => "function".into(),
+                LuaValue::Thread(_) => "thread".into(),
+                LuaValue::UserData(_) | LuaValue::LightUserData(_) => "userdata".into(),
+                LuaValue::Error(e) => e.to_string(),
+                _ => "?".into(),
+            })
+            .collect();
+        parts.join("\t")
+    }
+
     let lua = Lua::new_with(
         mlua::StdLib::TABLE | mlua::StdLib::STRING | mlua::StdLib::MATH | mlua::StdLib::IO,
         mlua::LuaOptions::default(),
@@ -978,11 +1027,30 @@ fn run_script_inner(
         },
     );
 
-    let proxy = BotProxy { req_tx, reply_rx, state: state.clone() };
+    let proxy = BotProxy {
+        req_tx,
+        reply_rx,
+        state: state.clone(),
+        stop_flag: stop_flag.clone(),
+    };
 
     let setup = || -> LuaResult<()> {
         lua.globals().set("__bot", lua.create_userdata(proxy)?)?;
-        lua.load("function getBot() return __bot end").exec()?;
+        // `bot` is the object the script box example uses. getBot() is the same object.
+        lua.load("function getBot() return __bot end\nbot = __bot").exec()?;
+
+        let cfg = lua.create_table()?;
+        cfg.set("place_delay", options.place_ms)?;
+        cfg.set("walk_delay", options.walk_ms)?;
+        cfg.set("auto_collect", options.auto_collect)?;
+        cfg.set("collect_range", options.collect_range)?;
+        cfg.set("collect_path_check", options.collect_path_check)?;
+        cfg.set("ignore_gems", options.ignore_gems)?;
+        cfg.set("ignore_essences", options.ignore_essences)?;
+        cfg.set("punch_reach", options.punch_reach)?;
+        cfg.set("farm_holes", options.farm_holes)?;
+        cfg.set("pickup_range", options.pickup_range)?;
+        lua.globals().set("config", cfg)?;
 
         // ── sleep(ms) ─────────────────────────────────────────────────────────
         {
@@ -997,6 +1065,73 @@ fn run_script_inner(
                 }
                 Ok(())
             })?)?;
+        }
+
+        // ── runScript(name) ───────────────────────────────────────────────────
+        {
+            let stop = stop_flag.clone();
+            let state2 = state.clone();
+            let ws2 = ws_tx.clone();
+            lua.globals().set(
+                "runScript",
+                lua.create_function(move |lua, name: String| {
+                    if stop.load(Ordering::Relaxed) {
+                        return Err(LuaError::runtime("__script_stop__"));
+                    }
+                    const MAX_DEPTH: i32 = 8;
+                    let depth: i32 = lua.globals().get("__runscript_depth").unwrap_or(0);
+                    if depth >= MAX_DEPTH {
+                        return Err(LuaError::runtime("runScript: too much nesting"));
+                    }
+                    let script = crate::options::find_script(&name)
+                        .map_err(LuaError::runtime)?;
+                    let msg = format!("[Lua] runScript \"{}\"", script.name);
+                    println!("{msg}");
+                    {
+                        let mut s = state2.write().unwrap();
+                        s.console.push(msg.clone());
+                        if s.console.len() > 500 {
+                            s.console.remove(0);
+                        }
+                    }
+                    if let Some(tx) = &ws2 {
+                        let _ = tx.send(crate::events::WsEvent::Console {
+                            bot_id,
+                            message: msg,
+                        });
+                    }
+                    lua.globals().set("__runscript_depth", depth + 1)?;
+                    let result = lua
+                        .load(&script.content)
+                        .set_name(format!("@lib/{}", script.name))
+                        .eval::<mlua::MultiValue>();
+                    let _ = lua.globals().set("__runscript_depth", depth);
+                    if let Ok(vals) = &result {
+                        if !vals.is_empty() {
+                            let ret = format!(
+                                "[Lua] \"{}\" -> {}",
+                                script.name,
+                                lua_vals_to_string(vals)
+                            );
+                            println!("{ret}");
+                            {
+                                let mut s = state2.write().unwrap();
+                                s.console.push(ret.clone());
+                                if s.console.len() > 500 {
+                                    s.console.remove(0);
+                                }
+                            }
+                            if let Some(tx) = &ws2 {
+                                let _ = tx.send(crate::events::WsEvent::Console {
+                                    bot_id,
+                                    message: ret,
+                                });
+                            }
+                        }
+                    }
+                    result
+                })?,
+            )?;
         }
 
         // ── getInfo(id | name) ────────────────────────────────────────────────
@@ -1067,6 +1202,44 @@ fn run_script_inner(
             }
             Ok(out)
         })?)?;
+
+        // ── print / log → panel console (not in-game chat) ────────────────────
+        {
+            let state2 = state.clone();
+            let ws2 = ws_tx.clone();
+            let emit = move |msg: String| {
+                let line = format!("[Lua] {msg}");
+                println!("{line}");
+                {
+                    let mut s = state2.write().unwrap();
+                    s.console.push(line.clone());
+                    if s.console.len() > 500 {
+                        s.console.remove(0);
+                    }
+                }
+                if let Some(tx) = &ws2 {
+                    let _ = tx.send(crate::events::WsEvent::Console {
+                        bot_id,
+                        message: line,
+                    });
+                }
+            };
+            let emit2 = emit.clone();
+            lua.globals().set(
+                "print",
+                lua.create_function(move |_, vals: mlua::MultiValue| {
+                    emit(lua_vals_to_string(&vals));
+                    Ok(())
+                })?,
+            )?;
+            lua.globals().set(
+                "log",
+                lua.create_function(move |_, vals: mlua::MultiValue| {
+                    emit2(lua_vals_to_string(&vals));
+                    Ok(())
+                })?,
+            )?;
+        }
 
         // ── clearConsole() ────────────────────────────────────────────────────
         {
@@ -1246,8 +1419,8 @@ do
             if name and pack_id then
                 local parsed_items = {}
                 if items and items ~= "" then
-                    for token in items:gmatch("[^,]+") do
-                        token = token:match("^%s*(.-)%s*$")
+                    for raw in items:gmatch("[^,]+") do
+                        local token = raw:match("^%s*(.-)%s*$")
                         parsed_items[#parsed_items + 1] = tonumber(token) or token
                     end
                 end
@@ -1415,14 +1588,159 @@ end
     };
 
     if let Err(e) = setup() {
-        state.write().unwrap().console.push(format!("`4[Lua setup error] {e}"));
+        report(format!("`4[Lua setup error] {e}"));
         return;
     }
 
+    report("[Lua] script started".to_string());
+
     if let Err(e) = lua.load(&script).exec() {
-        if !e.to_string().contains("__script_stop__") {
-            state.write().unwrap().console.push(format!("`4[Lua] {e}"));
+        let msg = e.to_string();
+        if msg.contains("__script_stop__") {
+            report("[Lua] script stopped".to_string());
+        } else {
+            report(format!("`4[Lua] {msg}"));
         }
+    } else {
+        report("[Lua] script finished".to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_script_threaded;
+    use crate::script_channel::{ScriptReply, ScriptRequest};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn documented_say_and_move_right_reach_the_bot() {
+        let (req_tx, req_rx) = crossbeam_channel::unbounded();
+        let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let state = Arc::new(RwLock::new(crate::bot_state::BotState::default()));
+        {
+            let mut s = state.write().unwrap();
+            s.pos_x = 10.0;
+            s.pos_y = 20.0;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let items = Arc::new(crate::items::ItemsDat {
+            version: 0,
+            items: Vec::new(),
+        });
+        let state2 = state.clone();
+        let handle = std::thread::spawn(move || {
+            run_script_threaded(
+                req_tx,
+                reply_rx,
+                event_rx,
+                items,
+                state2,
+                stop,
+                "test".into(),
+                "local b = getBot()\nb:say(\"script vivo\")\nb:moveRight(1)\n".into(),
+                0,
+                None,
+                crate::options::GlobalOptions::default(),
+            );
+        });
+
+        let mut saw_say = false;
+        let mut saw_walk = false;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && !(saw_say && saw_walk) {
+            match req_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(ScriptRequest::Say { text }) => {
+                    assert_eq!(text, "script vivo");
+                    saw_say = true;
+                    reply_tx.send(ScriptReply::Ack).unwrap();
+                }
+                Ok(ScriptRequest::Walk { tile_x, tile_y }) => {
+                    assert_eq!((tile_x, tile_y), (11, 20));
+                    saw_walk = true;
+                    reply_tx.send(ScriptReply::Ack).unwrap();
+                }
+                Ok(_) => panic!("unexpected script request"),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        handle.join().unwrap();
+        let console = state.read().unwrap().console.clone();
+        assert!(
+            saw_say && saw_walk,
+            "say={saw_say} walk={saw_walk} console={console:?}"
+        );
+    }
+
+    #[test]
+    fn stop_flag_unblocks_a_waiting_script_request() {
+        let (req_tx, _req_rx) = crossbeam_channel::unbounded();
+        let (_reply_tx, reply_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let state = Arc::new(RwLock::new(crate::bot_state::BotState::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let items = Arc::new(crate::items::ItemsDat {
+            version: 0,
+            items: Vec::new(),
+        });
+        let handle = std::thread::spawn(move || {
+            run_script_threaded(
+                req_tx,
+                reply_rx,
+                event_rx,
+                items,
+                state,
+                stop2,
+                "test".into(),
+                "while true do sleep(1000) end\n".into(),
+                0,
+                None,
+                crate::options::GlobalOptions::default(),
+            );
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle
+            .join()
+            .expect("script thread should exit after stop");
+    }
+
+    #[test]
+    fn config_table_is_injected() {
+        let (req_tx, _req_rx) = crossbeam_channel::unbounded();
+        let (_reply_tx, reply_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let state = Arc::new(RwLock::new(crate::bot_state::BotState::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let items = Arc::new(crate::items::ItemsDat {
+            version: 0,
+            items: Vec::new(),
+        });
+        let mut options = crate::options::GlobalOptions::default();
+        options.punch_reach = 2;
+        options.farm_holes = 2;
+        run_script_threaded(
+            req_tx,
+            reply_rx,
+            event_rx,
+            items,
+            state.clone(),
+            stop,
+            "test".into(),
+            "assert(config.punch_reach == 2)\nassert(config.farm_holes == 2)\n".into(),
+            0,
+            None,
+            options,
+        );
+        let console = state.read().unwrap().console.clone();
+        assert!(
+            console.iter().any(|line| line.contains("script finished")),
+            "{console:?}"
+        );
     }
 }
 

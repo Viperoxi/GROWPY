@@ -59,6 +59,23 @@ Returns the bot's GrowID (username).
 ### `sleep(ms: number)`
 Pauses script execution for the given number of milliseconds. Respects script stop signals.
 
+### `print(...)` / `log(...)`
+Writes to the bot Console tab in the panel. Does **not** send in-game chat (`bot:say` still does that). Multiple arguments are joined with tabs.
+
+```lua
+print("materiales ok")
+log("falta Signal Jammer")
+```
+
+### `runScript(name: string)`
+Runs another script from the panel library (Scripts) in the same Lua state. `name` matches the saved title, case-insensitive if unique, or the script id. Nested calls are allowed up to 8 levels. The called script runs to the end (or errors) before `runScript` returns; any `return` values are passed back and also logged to the console.
+
+```lua
+if runScript("check mats") == false then return end
+runScript("romper dirt farm")
+runScript("colocar dirt farm")
+```
+
 ### `read(path: string) -> string`
 Reads a file from disk and returns its contents as a string. Errors if file not found.
 
@@ -73,6 +90,22 @@ Strips Growtopia color codes (`` `X ``) from a string.
 
 ### `clearConsole()`
 Clears the bot's console log.
+
+### `config: table`
+Global options from the Options page. Applied to the bot before the script runs. Lua can still override `bot.place_delay` and similar fields.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `place_delay` | number | Place/punch delay in ms |
+| `walk_delay` | number | Walk delay in ms |
+| `auto_collect` | boolean | Auto-collect while idle |
+| `collect_range` | number | Auto-collect radius in tiles (1–5) |
+| `collect_path_check` | boolean | Skip drops with no A* path |
+| `ignore_gems` | boolean | Skip gem drops |
+| `ignore_essences` | boolean | Skip essence drops |
+| `punch_reach` | number | Suggested punch range in tiles |
+| `farm_holes` | number | Suggested holes per farm row end |
+| `pickup_range` | number | Suggested pickup range in tiles |
 
 ### `packs: string`
 Raw store-pack constant in `Name:PackID:Gems:Items` format.

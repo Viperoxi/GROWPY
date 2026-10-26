@@ -11,6 +11,7 @@ mod dashboard;
 pub mod items;
 mod login;
 mod lua;
+mod options;
 mod player;
 mod protocol;
 mod proxy_test;
