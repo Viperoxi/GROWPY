@@ -6,7 +6,7 @@ use axum::{
     http::{StatusCode, Method},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -19,8 +19,9 @@ use crate::auth::AuthState;
 use crate::bot::Socks5Config;
 use crate::bot_manager::{BotInfo, BotManager};
 use crate::bot_state::{BotCommand, BotDelays, BotState};
-use crate::events::WsTx;
+use crate::events::{WsEvent, WsTx};
 use crate::items::ItemInfo;
+use crate::options::{self, GlobalOptions, SavedProxy, SavedScript};
 use crate::proxy_test::{ProxyTestResult, run_proxy_test};
 
 pub type SharedManager = Arc<Mutex<BotManager>>;
@@ -149,10 +150,33 @@ struct SpawnRequest {
     proxy_password: Option<String>,
 }
 
+fn saved_proxy_from(
+    host: Option<&str>,
+    port: Option<u16>,
+    username: Option<String>,
+    password: Option<String>,
+) -> Option<SavedProxy> {
+    match (host, port) {
+        (Some(host), Some(port)) if !host.is_empty() => Some(SavedProxy {
+            host: host.to_string(),
+            port,
+            username,
+            password,
+        }),
+        _ => None,
+    }
+}
+
 async fn spawn_bot(
     State(s): State<AppState>,
     Json(req): Json<SpawnRequest>,
 ) -> Json<serde_json::Value> {
+    let proxy_saved = saved_proxy_from(
+        req.proxy_host.as_deref(),
+        req.proxy_port,
+        req.proxy_username.clone(),
+        req.proxy_password.clone(),
+    );
     let proxy = match (req.proxy_host, req.proxy_port) {
         (Some(host), Some(port)) => {
             let addr = format!("{}:{}", host, port)
@@ -173,7 +197,7 @@ async fn spawn_bot(
         }
         _ => None,
     };
-    let id = s.manager.lock().unwrap().spawn(req.username, req.password, proxy);
+    let id = s.manager.lock().unwrap().spawn(req.username, req.password, proxy, proxy_saved);
     Json(serde_json::json!({ "id": id }))
 }
 
@@ -190,6 +214,12 @@ async fn spawn_ltoken_bot(
     State(s): State<AppState>,
     Json(req): Json<SpawnLtokenRequest>,
 ) -> Json<serde_json::Value> {
+    let proxy_saved = saved_proxy_from(
+        req.proxy_host.as_deref(),
+        req.proxy_port,
+        req.proxy_username.clone(),
+        req.proxy_password.clone(),
+    );
     let proxy = match (req.proxy_host, req.proxy_port) {
         (Some(host), Some(port)) => {
             let addr = format!("{}:{}", host, port).parse().ok();
@@ -201,7 +231,7 @@ async fn spawn_ltoken_bot(
         }
         _ => None,
     };
-    let id = s.manager.lock().unwrap().spawn_ltoken(req.ltoken, proxy);
+    let id = s.manager.lock().unwrap().spawn_ltoken(req.ltoken, proxy, proxy_saved);
     Json(serde_json::json!({ "id": id }))
 }
 
@@ -366,6 +396,63 @@ async fn bot_cmd(
     }
 }
 
+async fn get_options() -> Json<GlobalOptions> {
+    Json(options::load_options())
+}
+
+async fn put_options(Json(req): Json<GlobalOptions>) -> Result<Json<GlobalOptions>, StatusCode> {
+    options::save_options(req)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn list_saved_scripts() -> Json<Vec<SavedScript>> {
+    Json(options::list_scripts())
+}
+
+#[derive(Deserialize)]
+struct ScriptBody {
+    name: String,
+    #[serde(default)]
+    content: String,
+}
+
+async fn create_saved_script(
+    Json(req): Json<ScriptBody>,
+) -> Result<Json<SavedScript>, StatusCode> {
+    if req.name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    options::create_script(req.name, req.content)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct ScriptPatch {
+    name: Option<String>,
+    content: Option<String>,
+}
+
+async fn update_saved_script(
+    Path(id): Path<String>,
+    Json(req): Json<ScriptPatch>,
+) -> Result<Json<SavedScript>, StatusCode> {
+    match options::update_script(&id, req.name, req.content) {
+        Ok(Some(script)) => Ok(Json(script)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn delete_saved_script(Path(id): Path<String>) -> StatusCode {
+    match options::delete_script(&id) {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 // ── Proxy test ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -472,12 +559,38 @@ async fn index_html() -> impl IntoResponse {
 }
 
 pub async fn serve(manager: SharedManager, ws_tx: WsTx) {
+    {
+        let mgr = manager.clone();
+        let mut rx = ws_tx.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                match ev {
+                    WsEvent::BotStatus { bot_id, status }
+                        if status == "connected" || status == "in_game" =>
+                    {
+                        if let Ok(mut m) = mgr.lock() {
+                            m.persist_success(bot_id);
+                        }
+                    }
+                    WsEvent::BotUsername { bot_id, username } => {
+                        if let Ok(mut m) = mgr.lock() {
+                            m.set_username(bot_id, username);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    manager.lock().unwrap().restore_saved();
+
     let auth = AuthState::new();
     let state = AppState { manager, ws_tx, auth };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(Any);
 
     let dist = std::env::current_dir()
@@ -503,6 +616,9 @@ pub async fn serve(manager: SharedManager, ws_tx: WsTx) {
         .route("/items/names", get(item_names))
         .route("/items/colors", get(item_colors))
         .route("/proxy/test", post(proxy_check))
+        .route("/options", get(get_options).put(put_options))
+        .route("/scripts", get(list_saved_scripts).post(create_saved_script))
+        .route("/scripts/{id}", put(update_saved_script).delete(delete_saved_script))
         .route("/growtopia-cdn/{*path}", get(growtopia_cdn))
         .route("/ws", get(ws_handler))
 

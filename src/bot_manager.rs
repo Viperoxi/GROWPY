@@ -1,25 +1,29 @@
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use crate::bot::{Socks5Config};
+use crate::bot::Socks5Config;
 use crate::bot_state::{BotCommand, BotState, BotStatus, CmdSender};
 use crate::events::{WsEvent, WsTx};
 use crate::items::ItemsDat;
+use crate::options::{self, SavedBot, SavedBotAuth, SavedProxy};
 
 pub struct BotEntry {
-    pub username:         String,
-    pub stop_flag:        Arc<AtomicBool>,
-    pub state:            Arc<RwLock<BotState>>,
-    pub cmd_tx:           CmdSender,
+    pub username:  String,
+    pub stop_flag: Arc<AtomicBool>,
+    pub state:     Arc<RwLock<BotState>>,
+    pub cmd_tx:    CmdSender,
+    saved:         SavedBot,
+    persisted:     bool,
 }
 
 pub struct BotManager {
-    next_id:   u32,
-    pub bots:  HashMap<u32, BotEntry>,
+    next_id:       u32,
+    pub bots:      HashMap<u32, BotEntry>,
     pub items_dat: Arc<ItemsDat>,
-    pub ws_tx: WsTx,
+    pub ws_tx:     WsTx,
 }
 
 #[derive(serde::Serialize)]
@@ -34,12 +38,81 @@ pub struct BotInfo {
     pub ping_ms: u32,
 }
 
+fn socks_from_saved(proxy: Option<&SavedProxy>) -> Option<Socks5Config> {
+    let p = proxy?;
+    let addr = format!("{}:{}", p.host, p.port)
+        .parse()
+        .ok()
+        .or_else(|| {
+            format!("{}:{}", p.host, p.port)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+        })?;
+    Some(Socks5Config {
+        proxy_addr: addr,
+        username: p.username.clone(),
+        password: p.password.clone(),
+    })
+}
+
+fn saved_from_socks(proxy: &Socks5Config) -> SavedProxy {
+    SavedProxy {
+        host: proxy.proxy_addr.ip().to_string(),
+        port: proxy.proxy_addr.port(),
+        username: proxy.username.clone(),
+        password: proxy.password.clone(),
+    }
+}
+
 impl BotManager {
     pub fn new(ws_tx: WsTx) -> Self {
         Self { next_id: 0, bots: HashMap::new(), items_dat: Arc::new(ItemsDat::load()), ws_tx }
     }
 
-    pub fn spawn(&mut self, username: String, password: String, proxy: Option<Socks5Config>) -> u32 {
+    pub fn spawn(
+        &mut self,
+        username: String,
+        password: String,
+        proxy: Option<Socks5Config>,
+        proxy_saved: Option<SavedProxy>,
+    ) -> u32 {
+        let saved = SavedBot {
+            key: options::persist_key_legacy(&username),
+            username: username.clone(),
+            auth: SavedBotAuth::Legacy {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            proxy: proxy_saved.or_else(|| proxy.as_ref().map(saved_from_socks)),
+        };
+        self.spawn_legacy_inner(username, password, proxy, saved)
+    }
+
+    pub fn spawn_ltoken(
+        &mut self,
+        ltoken_str: String,
+        proxy: Option<Socks5Config>,
+        proxy_saved: Option<SavedProxy>,
+    ) -> u32 {
+        let saved = SavedBot {
+            key: options::persist_key_ltoken(&ltoken_str),
+            username: String::new(),
+            auth: SavedBotAuth::Ltoken {
+                ltoken: ltoken_str.clone(),
+            },
+            proxy: proxy_saved.or_else(|| proxy.as_ref().map(saved_from_socks)),
+        };
+        self.spawn_ltoken_inner(ltoken_str, proxy, saved)
+    }
+
+    fn spawn_legacy_inner(
+        &mut self,
+        username: String,
+        password: String,
+        proxy: Option<Socks5Config>,
+        saved: SavedBot,
+    ) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -69,12 +142,24 @@ impl BotManager {
             }
         });
 
-        self.bots.insert(id, BotEntry { username: username.clone(), stop_flag, state, cmd_tx });
+        self.bots.insert(id, BotEntry {
+            username: username.clone(),
+            stop_flag,
+            state,
+            cmd_tx,
+            saved,
+            persisted: false,
+        });
         let _ = self.ws_tx.send(WsEvent::BotAdded { bot_id: id, username });
         id
     }
 
-    pub fn spawn_ltoken(&mut self, ltoken_str: String, proxy: Option<Socks5Config>) -> u32 {
+    fn spawn_ltoken_inner(
+        &mut self,
+        ltoken_str: String,
+        proxy: Option<Socks5Config>,
+        saved: SavedBot,
+    ) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -102,15 +187,80 @@ impl BotManager {
             }
         });
 
-        self.bots.insert(id, BotEntry { username: String::new(), stop_flag, state, cmd_tx });
-        let _ = self.ws_tx.send(WsEvent::BotAdded { bot_id: id, username: String::new() });
+        let username = saved.username.clone();
+        self.bots.insert(id, BotEntry {
+            username: username.clone(),
+            stop_flag,
+            state,
+            cmd_tx,
+            saved,
+            persisted: false,
+        });
+        let _ = self.ws_tx.send(WsEvent::BotAdded { bot_id: id, username });
         id
+    }
+
+    pub fn restore_saved(&mut self) {
+        let saved = options::load_saved_bots();
+        if saved.is_empty() {
+            return;
+        }
+        println!("[Hub] restoring {} saved bot(s)", saved.len());
+        for bot in saved {
+            let proxy = socks_from_saved(bot.proxy.as_ref());
+            match bot.auth.clone() {
+                SavedBotAuth::Legacy { username, password } => {
+                    self.spawn_legacy_inner(username, password, proxy, bot);
+                }
+                SavedBotAuth::Ltoken { ltoken } => {
+                    self.spawn_ltoken_inner(ltoken, proxy, bot);
+                }
+            }
+        }
+    }
+
+    pub fn persist_success(&mut self, id: u32) {
+        let Some(entry) = self.bots.get_mut(&id) else { return };
+        if entry.persisted {
+            return;
+        }
+        let live_name = {
+            let s = entry.state.read().unwrap();
+            if !s.username.is_empty() {
+                s.username.clone()
+            } else {
+                entry.username.clone()
+            }
+        };
+        if !live_name.is_empty() {
+            entry.username = live_name.clone();
+            entry.saved.username = live_name;
+        }
+        let saved = entry.saved.clone();
+        entry.persisted = true;
+        if let Err(e) = options::upsert_saved_bot(saved) {
+            println!("[Hub] failed to save bot: {e}");
+        }
+    }
+
+    pub fn set_username(&mut self, id: u32, username: String) {
+        let Some(entry) = self.bots.get_mut(&id) else { return };
+        entry.username = username.clone();
+        entry.saved.username = username;
+        if entry.persisted {
+            let saved = entry.saved.clone();
+            let _ = options::upsert_saved_bot(saved);
+        }
     }
 
     pub fn stop(&mut self, id: u32) -> bool {
         if let Some(entry) = self.bots.remove(&id) {
+            let key = entry.saved.key.clone();
             entry.stop_flag.store(true, Ordering::Relaxed);
             let _ = self.ws_tx.send(WsEvent::BotRemoved { bot_id: id });
+            if let Err(e) = options::remove_saved_bot(&key) {
+                println!("[Hub] failed to forget bot: {e}");
+            }
             true
         } else {
             false
@@ -120,9 +270,14 @@ impl BotManager {
     pub fn list(&self) -> Vec<BotInfo> {
         self.bots.iter().map(|(id, e)| {
             let s = e.state.read().unwrap();
+            let username = if !s.username.is_empty() {
+                s.username.clone()
+            } else {
+                e.username.clone()
+            };
             BotInfo {
                 id:       *id,
-                username: e.username.clone(),
+                username,
                 status:  s.status.to_string(),
                 world:   s.world_name.clone(),
                 pos_x:   s.pos_x,
