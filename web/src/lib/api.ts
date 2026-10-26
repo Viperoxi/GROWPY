@@ -245,6 +245,26 @@ export interface ItemsPage {
   page_size: number;
 }
 
+export interface GlobalOptions {
+  place_ms: number;
+  walk_ms: number;
+  auto_collect: boolean;
+  collect_range: number;
+  collect_path_check: boolean;
+  ignore_gems: boolean;
+  ignore_essences: boolean;
+  punch_reach: number;
+  farm_holes: number;
+  pickup_range: number;
+}
+
+export interface SavedScript {
+  id: string;
+  name: string;
+  content: string;
+  updated_at: number;
+}
+
 export const api = {
   authStatus: () =>
     fetch(`${BASE}/auth/status`).then((r) => r.json()) as Promise<{
@@ -282,6 +302,14 @@ export const api = {
     req<ItemRecord[]>("GET", `/items?get-items=${ids.join(",")}`),
   testProxy: (body: ProxyTestRequest) =>
     req<ProxyTestResult>("POST", "/proxy/test", body),
+  getOptions: () => req<GlobalOptions>("GET", "/options"),
+  saveOptions: (body: GlobalOptions) => req<GlobalOptions>("PUT", "/options", body),
+  listScripts: () => req<SavedScript[]>("GET", "/scripts"),
+  createScript: (body: { name: string; content: string }) =>
+    req<SavedScript>("POST", "/scripts", body),
+  updateScript: (id: string, body: { name?: string; content?: string }) =>
+    req<SavedScript>("PUT", `/scripts/${id}`, body),
+  deleteScript: (id: string) => req<void>("DELETE", `/scripts/${id}`),
 };
 
 export const external_api = {

@@ -17,7 +17,7 @@ import {
   itemNamesAtom,
   type LiveBot,
 } from "@/lib/store";
-import { api } from "@/lib/api";
+import { api, type SavedScript } from "@/lib/api";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/table";
 import { parseGTColors } from "@/lib/gt-colors";
 import { Minimap } from "@/components/minimap";
+import { LuaEditor, type LuaEditorHandle } from "@/components/lua-editor";
 import { cn } from "@/lib/utils";
 import type { BotStatus } from "@/lib/api";
 
@@ -548,19 +549,124 @@ function ConsoleTab({ lines }: { lines: string[] }) {
 
 // ── Script tab ──────────────────────────────────────────────────────────────
 
+type RunScriptPicker = {
+  quote: '"' | "'";
+  typed: string;
+  argStart: number;
+  argEnd: number;
+  needsClose: boolean;
+  bare: boolean;
+};
+
+function findRunScriptArg(text: string, caret: number): RunScriptPicker | null {
+  const before = text.slice(0, caret);
+  const quoted = before.match(/runScript\s*\(\s*(["'])([^"']*)$/i);
+  if (quoted) {
+    const quote = quoted[1] as '"' | "'";
+    const typed = quoted[2] ?? "";
+    const argStart = caret - typed.length;
+    const rest = text.slice(caret);
+    const close = rest.indexOf(quote);
+    if (close >= 0) {
+      return { quote, typed, argStart, argEnd: caret + close, needsClose: false, bare: false };
+    }
+    return { quote, typed, argStart, argEnd: caret, needsClose: true, bare: false };
+  }
+  if (/runScript\s*\(\s*$/i.test(before)) {
+    return {
+      quote: '"',
+      typed: "",
+      argStart: caret,
+      argEnd: caret,
+      needsClose: true,
+      bare: true,
+    };
+  }
+  return null;
+}
+
 function ScriptTab({ botId }: { botId: number }) {
+  const editorRef = useRef<LuaEditorHandle>(null);
   const [script, setScript] = useState("");
   const [status, setStatus] = useState("");
+  const [library, setLibrary] = useState<SavedScript[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [query, setQuery] = useState("");
+  const [saveName, setSaveName] = useState("");
+  const [picker, setPicker] = useState<RunScriptPicker | null>(null);
+  const [pickIndex, setPickIndex] = useState(0);
+
+  async function refreshLibrary() {
+    try {
+      const list = await api.listScripts();
+      setLibrary(list.sort((a, b) => a.name.localeCompare(b.name)));
+    } catch {
+      /* keep current list */
+    }
+  }
+
+  useEffect(() => {
+    refreshLibrary();
+  }, []);
 
   useEffect(() => {
     const saved = localStorage.getItem(`bot_script_${botId}`);
+    const savedId = localStorage.getItem(`bot_script_id_${botId}`) ?? "";
     setScript(saved ?? "");
+    setSelectedId(savedId);
   }, [botId]);
+
+  useEffect(() => {
+    const found = library.find((s) => s.id === selectedId);
+    setSaveName(found?.name ?? "");
+  }, [library, selectedId]);
+
+  const filtered = library.filter((s) =>
+    s.name.toLowerCase().includes(query.trim().toLowerCase()),
+  );
+
+  const pickOptions = picker
+    ? library.filter((s) =>
+        s.name.toLowerCase().includes(picker.typed.toLowerCase()),
+      )
+    : [];
+
+  useEffect(() => {
+    setPickIndex(0);
+  }, [picker?.typed]);
+
+  function insertRunScriptName(name: string) {
+    if (!picker) return;
+    const inner = name.replace(/\\/g, "\\\\").replace(new RegExp(picker.quote, "g"), `\\${picker.quote}`);
+    let insert = inner;
+    if (picker.needsClose) insert += picker.quote;
+    if (picker.bare && script.slice(picker.argEnd).trimStart()[0] !== ")") {
+      insert += ")";
+    }
+    const caret = picker.argStart + insert.length + (picker.needsClose ? 0 : 1);
+    editorRef.current?.replaceRange(picker.argStart, picker.argEnd, insert, caret);
+    setPicker(null);
+  }
+
+  function persist(nextScript: string, nextId: string) {
+    localStorage.setItem(`bot_script_${botId}`, nextScript);
+    if (nextId) localStorage.setItem(`bot_script_id_${botId}`, nextId);
+    else localStorage.removeItem(`bot_script_id_${botId}`);
+  }
+
+  function pick(id: string) {
+    const found = library.find((s) => s.id === id);
+    if (!found) return;
+    setSelectedId(id);
+    setScript(found.content);
+    setSaveName(found.name);
+    persist(found.content, id);
+  }
 
   async function run() {
     try {
       await api.sendCmd(botId, { type: "run_script", content: script });
-      localStorage.setItem(`bot_script_${botId}`, script);
+      persist(script, selectedId);
       setStatus("Running…");
     } catch {
       setStatus("Error");
@@ -576,16 +682,125 @@ function ScriptTab({ botId }: { botId: number }) {
     }
   }
 
+  async function saveSelected() {
+    const trimmed = saveName.trim();
+    if (!trimmed) {
+      setStatus("Name required");
+      return;
+    }
+    try {
+      if (selectedId) {
+        const updated = await api.updateScript(selectedId, {
+          name: trimmed,
+          content: script,
+        });
+        await refreshLibrary();
+        setSelectedId(updated.id);
+        persist(script, updated.id);
+        setStatus("Saved");
+      } else {
+        const created = await api.createScript({ name: trimmed, content: script });
+        await refreshLibrary();
+        setSelectedId(created.id);
+        persist(script, created.id);
+        setStatus("Saved");
+      }
+    } catch {
+      setStatus("Error");
+    }
+  }
+
   return (
     <>
-      <textarea
-        value={script}
-        onChange={(e) => setScript(e.target.value)}
-        spellCheck={false}
-        className="flex-1 font-mono text-[13px] bg-background border border-border rounded p-3 text-foreground resize-none outline-none leading-relaxed focus:border-ring transition-colors"
-        placeholder={'-- Lua script\nbot:warp("START")\nsleep(500)'}
-      />
-      <div className="shrink-0 flex items-center gap-2">
+      <div className="shrink-0 flex flex-col gap-2">
+        <Input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search library..."
+          className="h-7 text-xs"
+        />
+        <select
+          value={selectedId}
+          onChange={(e) => pick(e.target.value)}
+          className="h-8 rounded-lg border border-input bg-background px-2 text-xs text-foreground outline-none focus:border-ring"
+        >
+          <option value="">Unsaved editor</option>
+          {filtered.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="relative flex-1 min-h-0 flex flex-col">
+        <LuaEditor
+          ref={editorRef}
+          value={script}
+          onChange={setScript}
+          placeholder={'local bot = getBot()\nbot:say("hello")\nbot:moveRight(1)'}
+          onCursor={(text, pos) => setPicker(findRunScriptArg(text, pos))}
+          onSpecialKey={(key) => {
+            if (!picker) return false;
+            if (key === "Escape") {
+              setPicker(null);
+              return true;
+            }
+            if (pickOptions.length === 0) return false;
+            if (key === "ArrowDown") {
+              setPickIndex((i) => (i + 1) % pickOptions.length);
+              return true;
+            }
+            if (key === "ArrowUp") {
+              setPickIndex((i) => (i - 1 + pickOptions.length) % pickOptions.length);
+              return true;
+            }
+            if (key === "Enter" || key === "Tab") {
+              const chosen = pickOptions[pickIndex] ?? pickOptions[0];
+              if (chosen) insertRunScriptName(chosen.name);
+              return true;
+            }
+            return false;
+          }}
+        />
+        {picker && (
+          <div className="absolute left-2 right-2 bottom-2 z-20 max-h-40 overflow-auto rounded-md border border-border bg-popover shadow-md">
+            {pickOptions.length === 0 ? (
+              <p className="px-2 py-1.5 text-[11px] text-muted-foreground">
+                No library scripts
+              </p>
+            ) : (
+              pickOptions.map((s, i) => (
+                <button
+                  type="button"
+                  key={s.id}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    insertRunScriptName(s.name);
+                  }}
+                  className={cn(
+                    "w-full text-left px-2 py-1.5 text-xs truncate",
+                    i === pickIndex
+                      ? "bg-accent text-accent-foreground"
+                      : "hover:bg-muted",
+                  )}
+                >
+                  {s.name}
+                </button>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+      <div className="shrink-0 flex flex-wrap items-center gap-2">
+        <Input
+          value={saveName}
+          onChange={(e) => setSaveName(e.target.value)}
+          placeholder="Name to save"
+          className="h-7 text-xs w-36"
+        />
+        <Button size="sm" variant="outline" className="text-xs" onClick={saveSelected}>
+          Save
+        </Button>
         <Button size="sm" variant="default" className="text-xs" onClick={run}>
           Run
         </Button>
